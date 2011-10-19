@@ -1,0 +1,211 @@
+#!/usr/bin/env perl
+
+use Mojolicious::Lite;
+use utf8;
+use lib 'lib';
+use MyUsers;
+use MyDb;
+use MyEmail;
+use UUID::Tiny ':std';
+use Net::Domain qw(hostfqdn);
+
+# Globals
+my $adminpw = "123";
+my $ldaphost = "localhost";
+my $wwwhost  = "localhost:3000"; # hostfqdn() || "localhost";
+
+# turn on debugging
+app->log->level("debug");
+
+# set our top secret session key
+app->secret("labben i fn3");
+
+# create a users session and helper
+my $users = MyUsers->new(host => $ldaphost, bindpw => $adminpw) || die "$@";
+helper users => sub { return $users };
+
+# crete a database session and helper
+my $db = MyDb->new();
+helper db => sub { return $db };
+
+
+# the main page is the index template
+get '/' => sub {
+  my $self = shift;
+  my $email = $self->param('email') || '';
+
+  return $self->render(msg => '')
+    unless $email;
+
+  # search for uid based on email
+  my ($uid, $gecos) = $self->users->find_email($email);
+  return $self->render(msg => "Ingen bruker med den email-adressen")
+    unless $uid;
+  
+  # generate a unique identifier based on random numbers, but remove all dashes
+  my $key = create_uuid_as_string(UUID_V4);
+  $key =~ s/-//g;
+  
+  # clear database from earlier reset tries from $uid
+  $self->db->clear_uid($uid);
+  
+  # store uid and uuid in database
+  return $self->render(msg => "Bummer, couldn't store the key")
+    unless $self->db->store(uid => $uid, gecos => $gecos, key => $key);
+  
+  # send email to user with instructions
+  my $res = MyEmail->send_email(username => $uid, email => $email, 
+				key => $key, host => $wwwhost);
+
+  $self->flash(email => $email, key => $key, host => $wwwhost);
+  return $self->redirect_to('/sent');
+} => 'index';
+
+
+# give info about sent email, and expire all session cookies
+get '/sent' => sub { app->session(expires => 1) } => 'sent';
+
+
+# when the user are changing password, they end up here
+get '/reset/:key' => sub {
+  my $self = shift;
+  
+  my $key  = $self->param('key') || '';
+  return $self->render('failure', msg => 'Mangler gjenopprettingslink') 
+    unless $key;
+  
+  # is it a valid key?
+  my ($uid, $gecos) = $self->db->retreive($key);
+  return $self->render('failure', msg => 'Gjenopprettingslinken er ikke lenger gyldig') 
+    unless $uid;
+
+  # store info in session cookie
+  $self->session->{uid} = $uid; 
+  $self->session->{gecos} = $gecos; 
+  return $self->render;
+} => 'reset';
+
+
+# validate passwords
+post '/validate_password' => sub {
+  my $self = shift;
+  
+  my $pw1 = $self->param('pw1');
+  my $pw2 = $self->param('pw2');
+  
+  # both pw1 and pw2 must be non-empty 
+  return $self->render(msg => "Du må angi passordet to ganger")
+    unless $pw1 && $pw2;
+  
+  # pw1 and pw2 must be equal
+  return $self->render(msg => "Passordene er ikke like")
+    unless $pw1 eq $pw2;
+  
+  # the password must be at least 6 chars long
+  return $self->render(msg => "Passordet må være 6 tegn langt")
+    unless length $pw1 >= 6;
+  
+  return $self->render(msg => "Bummer, couldn't change password")
+    unless $self->users->set_passwd($self->session->{uid}, $pw1);
+  
+  # if we got here, we managed to change the password
+  # invalidate the reset link, clear all cookies, and 
+  # inform the user about the success
+  $self->db->clear_uid($self->session->{uid});
+  $self->session(expire => 1);
+  return $self->redirect_to('success');
+} => 'reset';
+
+any '/success' => 'success';
+
+
+app->start;
+
+__DATA__
+
+@@ index.html.ep
+% layout 'default';
+% title 'Gjenoppretting av bruker og/eller passord';
+<h2>Har du glemt brukernavnet og/eller passordet ditt?</h2>
+
+<p>Ikke noe problem, bare oppgi din interne epost-adresse (@ventelo.no) 
+så sender vi deg epost med brukernavnet ditt og instruksjoner hvordan velge
+et nytt passord.</p>
+
+%= form_for 'index' => begin
+  Epost-adresse
+  %= input_tag 'email', type => 'email'
+  <br>
+  %= submit_button "Utfør"
+% end
+
+<span class="red">
+%= stash 'msg'
+</span>
+
+
+@@ reset.html.ep
+% layout 'default';
+% title 'Velge nytt passord';
+<h2>Hei <%= session 'gecos' %>!</h2>
+
+<p>Velg det nye passordet du ønsker for brukeren din 
+&quot;<%= session 'uid' %>&quot;. 
+Passordet må være minst 6 tegn langt.</p>
+
+%= form_for '/validate_password' => (method =>  'post') => begin
+  Passordet:
+  %= password_field 'pw1'
+  <br>
+
+  Gjenta passordet:
+  %= password_field 'pw2'
+  <br>
+
+  %= submit_button 'Lagre'
+% end
+
+<span class="red"><%= stash 'msg' %></span>
+
+
+@@ sent.html.ep
+% layout 'default';
+% title "E-post sent";
+<h2>E-post sent</h2>
+<p>En e-post med instruksjoner hvordan gå videre i gjenopprettingsprosedyren 
+er sent til epost-adressen: <%= flash 'email' %>
+</p>
+
+
+@@ success.html.ep
+% layout 'default';
+% title 'Passordet er byttet';
+<h2>Passordet ditt er nå byttet</h2>
+<p>Prøv det nye passordet ved å logge inn med ssh på 
+<a href="ssh://srv1.lab.as2116.net">srv1.lab.as2116.net</a>.</p>
+<p>Dersom du fortsatt ikke får logget på, prøv gjenopprettingsprosedyren
+én gang til. Fungerer det ikke da heller, ta kontakt med en av
+<a href="http://wiki.lab.as2116.net/login.html">administratørene</a>.</p>
+
+
+
+@@ failure.html.ep
+% layout 'default';
+% title 'Feilmelding';
+<h2>Det har oppstått en feil</h2>
+<p><%= stash 'msg' %></p>
+
+
+
+@@ layouts/default.html.ep
+<!doctype html>
+<html>
+<head>
+<title><%= title %></title>
+<meta charset="UTF-8" />
+<link rel="stylesheet" type="text/css" href="/style.css">
+</head>
+<body>
+<%= content %>
+</body>
+</html>

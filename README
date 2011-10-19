@@ -1,0 +1,8 @@
+This is a very simple web-app for resetting a password
+stored in LDAP.
+
+By entering the email-address used when registering
+(a separate non-existing app), the user will receive
+a email with a one-time link to a password reset dialog.
+
+The new passord is then stored in the LDAP repository.
