@@ -1,0 +1,286 @@
+#!/usr/bin/env perl
+
+use Mojolicious::Lite;
+use Net::LDAP;
+
+#use Digest::SHA qw( sha1_base64 );
+
+# Globals
+my $base    = "dc=hemmop,dc=com";
+my $people  = "ou=People,$base";
+my $host    = "localhost";
+my $admindn = "cn=admin,$base";
+my $adminpw = "123";
+
+# create a LDAP session
+my $ldap = Net::LDAP->new($host) || die "$@";
+
+# set our top secret session key
+app->secret("labben i fn3");
+
+# turn on debugging
+app->log->level("debug");
+
+# the main page is the index template
+get '/' => 'index';
+
+# a static storage
+#get '/static' => 'static';
+
+
+post '/login' => sub {
+  my $self = shift;
+  my $uid  = $self->param('uid') || '';
+  my $pw   = $self->param('pw') || '';
+
+  # Try a bind with the supplied uid and pw
+  my $dn = "uid=$uid,$people";
+  my $msg = $ldap->bind($dn, password => $pw);
+
+  # If $msg->code is set the bind failed
+  if ($msg->code) {
+    my $str = "Wrong username or password: " . $msg->error;
+    $self->render(text => $str);
+  }
+
+  # store uid
+  $self->session->{uid} = $uid;
+
+  # find the name of the logged in user
+  $msg = $ldap->search(
+    base   => $base,
+    filter => "(uid=$uid)",
+    attr   => [qw( cn )],
+  );
+
+  # get cn from user entry or just use "No name"
+  $self->session->{cn} =
+    $msg->code ? "No name" : $msg->entry(0)->get_entry("cn");
+
+  # Is this an admin user or not?
+  # Admins are member of the sudoers group
+  $msg = $ldap->search(
+    base   => $base,
+    filter => "(&(cn=sudoers)(memberUid=$uid))",
+  );
+
+  # If we got a hit, this IS an admin
+  if ($msg->count) {
+
+    # as admins we need some priviledge escalation,
+    # i.e. rebind as the repository admin
+    $msg = $ldap->bind($admindn, password => $adminpw);
+
+    # debug
+    $self->app->log->debug("rebind failed: " . $msg->error) if ($msg->code);
+
+    $self->session->{admin} = 1;
+    $self->render('admin');
+  } ## end if ($msg->count)
+  else {
+    $self->session->{admin} = 0;
+    $self->render('user');
+  }
+};
+
+
+# this is the ordinary user protected area
+under '/user' => sub {
+  my $self;
+  $self->render() unless $self->session->{uid};
+};
+
+# this is the admin protected area
+under '/admin' => sub {
+  my $self;
+  $self->render()
+    unless $self->session->{uid} && $self->session->{admin};
+};
+
+
+get "/edituser" => 'edituser';
+
+
+# get '/reset' => sub { shift->render('reset') };
+
+post '/action/adduser' => sub {
+  my $self = shift;
+
+  my ($uidnum, $result, $entry);
+
+  my $uid   = $self->param('uid')   || '';
+  my $name  = $self->param('name')  || '';
+  my $email = $self->param('email') || '';
+  $email .= "\@ventelo.no";
+  my $shell = $self->param('shell');
+  my $sudo  = $self->param('sudo');
+  my $group = $self->param('group');
+
+  my $count = 0;
+
+  do {
+
+    # find highest uidNumber in use
+    $result = $ldap->search(
+      base   => $base,
+      filter => "(uid=__lastuidnumber)",
+    );
+
+    $self->app->log->debug("uidSearch failed: " . $result->error)
+      if $result->code;
+
+    $entry  = $result->entry(0);
+    $uidnum = $entry->get_value('uidNumber');
+
+    $self->app->log->debug("found uidnum $uidnum");
+
+    # update repository with new highest uidNumber
+    $result = $ldap->modify(
+      "uid=__lastuidnumber,$people",
+      delete => {'uidNumber' => $uidnum},
+      add    => {'uidNumber' => ++$uidnum},
+    );
+
+    $self->app->log->debug("update of uidnum failed: " . $result->error)
+      if $result->code;
+  } while (++$count < 5 && $result->code);
+
+  # create the new user
+  $result = $ldap->add(
+    "uid=$uid,ou=People,$base",
+    attrs => [
+      'objectClass'      => [qw(account posixAccount shadowAccount)],
+      'uid'              => $uid,
+      'cn'               => $name,
+      'shadowLastChange' => 0,
+      'loginShell'       => $shell,
+      'uidNumber'        => $uidnum,
+      'gidNumber'        => 100,
+      'homeDirectory'    => "/home/$uid",
+      'userPassword'     => "changeme",
+    ]
+  );
+
+  $self->render(text => "Adding user failed. Sorry... " . $result->error)
+    if $result->code;
+
+  $self->render(text => "Whoho. It worked");
+};
+
+
+get '/action/send_reset_email' => sub {
+  my $self = shift;
+  $self->render(text => "sending email");
+};
+
+
+app->start;
+
+__DATA__
+
+@@ index.html.ep
+% layout 'default';
+% title 'User admin';
+<h2>Welcome to User admin!</h2>
+%= form_for '/login' => (method => 'post' ) => begin
+  User name: 
+  %= text_field 'uid'
+  <br>
+
+  Password:
+  %= password_field 'pw'
+  <br>
+
+  %= submit_button "Login"
+  <br>
+  %= link_to "I've forgotten my username or password" => 'reset'
+% end
+
+
+@@ reset.html.ep
+% layout 'default';
+% title 'Reset password';
+<h2>Enter the email address used when registering</h2>
+%= form_for 'send_reset_email' => (method =>  'post') => begin
+  Email address:
+  %= text_field 'email'
+  @ventelo.no
+  <br>
+
+  %= submit_button "Send"
+% end
+
+
+@@ admin.html.ep
+% layout 'default';
+% title  'Admin';
+<h2>Administer users</h2>
+This is the place to administer all users
+<br>
+Do you want to:
+%= link_to "Add a new user" => 'adduser';
+<br>
+or
+%= link_to "Edit an existing user" => 'edituser';
+
+
+@@ adduser.html.ep
+% layout 'default';
+% title  'Add user';
+<h2>Add a user to the LDAP repository</h2>
+%= form_for '/action/adduser' => (method => 'post' ) => begin
+  Login name: 
+  %= text_field 'uid'
+  <br />
+
+  Name of user:
+  %= text_field 'name'
+  <br />
+
+  Email address:
+  %= text_field 'email'
+  @ventelo.no
+  <br />
+
+  Default shell:
+  %= radio_button shell => "/bin/bash"
+  bash
+  <br />
+  %= radio_button shell => "/usr/bin/tcsh"
+  tcsh
+  <br />
+
+  The user should have sudo rights?
+  %= check_box sudo => 0
+  <br />
+
+  Which access rights should the user have to network devices?<br />
+  %= radio_button group => "__full"
+  Full (read and write to everything)
+  <br />
+
+  %= radio_button group => "__limited"
+  Limited (read and write to everything, but with some disabled commands)
+  <br />
+
+  %= radio_button group => "__readonly"
+  Read only (read on everything, including running config)
+  <br />
+
+  %= submit_button "Add user"
+% end
+
+
+@@ user.html.ep
+% layout 'default';
+% title  'Users';
+<h2>User self service</h2>
+This is the place to administer your profile
+<br>
+
+
+@@ layouts/default.html.ep
+<!doctype html><html>
+  <head><title><%= title %></title></head>
+  <body><%= content %></body>
+</html>
