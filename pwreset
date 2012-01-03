@@ -1,177 +1,122 @@
 #!/usr/bin/env perl
 
 use Mojolicious::Lite;
-use Net::LDAP;
-
-#use Digest::SHA qw( sha1_base64 );
+use utf8;
+use lib 'lib';
+use MyUsers;
+use MyDb;
+use MyEmail;
+use UUID::Tiny ':std';
+use Net::Domain qw(hostfqdn);
 
 # Globals
-my $base    = "dc=hemmop,dc=com";
-my $people  = "ou=People,$base";
-my $host    = "localhost";
-my $admindn = "cn=admin,$base";
 my $adminpw = "123";
-
-# create a LDAP session
-my $ldap = Net::LDAP->new($host) || die "$@";
-
-# set our top secret session key
-app->secret("labben i fn3");
+my $ldaphost = "localhost";
+my $wwwhost  = "localhost:3000"; # hostfqdn() || "localhost";
 
 # turn on debugging
 app->log->level("debug");
 
+# set our top secret session key
+app->secret("labben i fn3");
+
+# create a users session and helper
+my $users = MyUsers->new(host => $ldaphost, bindpw => $adminpw) || die "$@";
+helper users => sub { return $users };
+
+# crete a database session and helper
+my $db = MyDb->new();
+helper db => sub { return $db };
+
+
 # the main page is the index template
-get '/' => 'index';
-
-# a static storage
-#get '/static' => 'static';
-
-
-post '/login' => sub {
+get '/' => sub {
   my $self = shift;
-  my $uid  = $self->param('uid') || '';
-  my $pw   = $self->param('pw') || '';
-
-  # Try a bind with the supplied uid and pw
-  my $dn = "uid=$uid,$people";
-  my $msg = $ldap->bind($dn, password => $pw);
-
-  # If $msg->code is set the bind failed
-  if ($msg->code) {
-    my $str = "Wrong username or password: " . $msg->error;
-    $self->render(text => $str);
-  }
-
-  # store uid
-  $self->session->{uid} = $uid;
-
-  # find the name of the logged in user
-  $msg = $ldap->search(
-    base   => $base,
-    filter => "(uid=$uid)",
-    attr   => [qw( cn )],
-  );
-
-  # get cn from user entry or just use "No name"
-  $self->session->{cn} =
-    $msg->code ? "No name" : $msg->entry(0)->get_entry("cn");
-
-  # Is this an admin user or not?
-  # Admins are member of the sudoers group
-  $msg = $ldap->search(
-    base   => $base,
-    filter => "(&(cn=sudoers)(memberUid=$uid))",
-  );
-
-  # If we got a hit, this IS an admin
-  if ($msg->count) {
-
-    # as admins we need some priviledge escalation,
-    # i.e. rebind as the repository admin
-    $msg = $ldap->bind($admindn, password => $adminpw);
-
-    # debug
-    $self->app->log->debug("rebind failed: " . $msg->error) if ($msg->code);
-
-    $self->session->{admin} = 1;
-    $self->render('admin');
-  } ## end if ($msg->count)
-  else {
-    $self->session->{admin} = 0;
-    $self->render('user');
-  }
-};
-
-
-# this is the ordinary user protected area
-under '/user' => sub {
-  my $self;
-  $self->render() unless $self->session->{uid};
-};
-
-# this is the admin protected area
-under '/admin' => sub {
-  my $self;
-  $self->render()
-    unless $self->session->{uid} && $self->session->{admin};
-};
-
-
-get "/edituser" => 'edituser';
-
-
-# get '/reset' => sub { shift->render('reset') };
-
-post '/action/adduser' => sub {
-  my $self = shift;
-
-  my ($uidnum, $result, $entry);
-
-  my $uid   = $self->param('uid')   || '';
-  my $name  = $self->param('name')  || '';
   my $email = $self->param('email') || '';
-  $email .= "\@ventelo.no";
-  my $shell = $self->param('shell');
-  my $sudo  = $self->param('sudo');
-  my $group = $self->param('group');
 
-  my $count = 0;
+  return $self->render(msg => '')
+    unless $email;
 
-  do {
+  # search for uid based on email
+  my ($uid, $gecos) = $self->users->find_email($email);
+  return $self->render(msg => "Ingen bruker med den email-adressen")
+    unless $uid;
+  
+  # generate a unique identifier based on random numbers, but remove all dashes
+  my $key = create_uuid_as_string(UUID_V4);
+  $key =~ s/-//g;
+  
+  # clear database from earlier reset tries from $uid
+  $self->db->clear_uid($uid);
+  
+  # store uid and uuid in database
+  return $self->render(msg => "Bummer, couldn't store the key")
+    unless $self->db->store(uid => $uid, gecos => $gecos, key => $key);
+  
+  # send email to user with instructions
+  my $res = MyEmail->send_email(username => $uid, email => $email, 
+				key => $key, host => $wwwhost);
 
-    # find highest uidNumber in use
-    $result = $ldap->search(
-      base   => $base,
-      filter => "(uid=__lastuidnumber)",
-    );
-
-    $self->app->log->debug("uidSearch failed: " . $result->error)
-      if $result->code;
-
-    $entry  = $result->entry(0);
-    $uidnum = $entry->get_value('uidNumber');
-
-    $self->app->log->debug("found uidnum $uidnum");
-
-    # update repository with new highest uidNumber
-    $result = $ldap->modify(
-      "uid=__lastuidnumber,$people",
-      delete => {'uidNumber' => $uidnum},
-      add    => {'uidNumber' => ++$uidnum},
-    );
-
-    $self->app->log->debug("update of uidnum failed: " . $result->error)
-      if $result->code;
-  } while (++$count < 5 && $result->code);
-
-  # create the new user
-  $result = $ldap->add(
-    "uid=$uid,ou=People,$base",
-    attrs => [
-      'objectClass'      => [qw(account posixAccount shadowAccount)],
-      'uid'              => $uid,
-      'cn'               => $name,
-      'shadowLastChange' => 0,
-      'loginShell'       => $shell,
-      'uidNumber'        => $uidnum,
-      'gidNumber'        => 100,
-      'homeDirectory'    => "/home/$uid",
-      'userPassword'     => "changeme",
-    ]
-  );
-
-  $self->render(text => "Adding user failed. Sorry... " . $result->error)
-    if $result->code;
-
-  $self->render(text => "Whoho. It worked");
-};
+  $self->flash(email => $email, key => $key, host => $wwwhost);
+  return $self->redirect_to('/sent');
+} => 'index';
 
 
-get '/action/send_reset_email' => sub {
+# give info about sent email, and expire all session cookies
+get '/sent' => sub { app->session(expires => 1) } => 'sent';
+
+
+# when the user are changing password, they end up here
+get '/reset/:key' => sub {
   my $self = shift;
-  $self->render(text => "sending email");
-};
+  
+  my $key  = $self->param('key') || '';
+  return $self->render('failure', msg => 'Mangler gjenopprettingslink') 
+    unless $key;
+  
+  # is it a valid key?
+  my ($uid, $gecos) = $self->db->retreive($key);
+  return $self->render('failure', msg => 'Gjenopprettingslinken er ikke lenger gyldig') 
+    unless $uid;
+
+  # store info in session cookie
+  $self->session->{uid} = $uid; 
+  $self->session->{gecos} = $gecos; 
+  return $self->render;
+} => 'reset';
+
+
+# validate passwords
+post '/validate_password' => sub {
+  my $self = shift;
+  
+  my $pw1 = $self->param('pw1');
+  my $pw2 = $self->param('pw2');
+  
+  # both pw1 and pw2 must be non-empty 
+  return $self->render(msg => "Du må angi passordet to ganger")
+    unless $pw1 && $pw2;
+  
+  # pw1 and pw2 must be equal
+  return $self->render(msg => "Passordene er ikke like")
+    unless $pw1 eq $pw2;
+  
+  # the password must be at least 6 chars long
+  return $self->render(msg => "Passordet må være 6 tegn langt")
+    unless length $pw1 >= 6;
+  
+  return $self->render(msg => "Bummer, couldn't change password")
+    unless $self->users->set_passwd($self->session->{uid}, $pw1);
+  
+  # if we got here, we managed to change the password
+  # invalidate the reset link, clear all cookies, and 
+  # inform the user about the success
+  $self->db->clear_uid($self->session->{uid});
+  $self->session(expire => 1);
+  return $self->redirect_to('success');
+} => 'reset';
+
+any '/success' => 'success';
 
 
 app->start;
@@ -180,107 +125,87 @@ __DATA__
 
 @@ index.html.ep
 % layout 'default';
-% title 'User admin';
-<h2>Welcome to User admin!</h2>
-%= form_for '/login' => (method => 'post' ) => begin
-  User name: 
-  %= text_field 'uid'
-  <br>
+% title 'Gjenoppretting av bruker og/eller passord';
+<h2>Har du glemt brukernavnet og/eller passordet ditt?</h2>
 
-  Password:
-  %= password_field 'pw'
-  <br>
+<p>Ikke noe problem, bare oppgi din interne epost-adresse (@ventelo.no) 
+så sender vi deg epost med brukernavnet ditt og instruksjoner hvordan velge
+et nytt passord.</p>
 
-  %= submit_button "Login"
+%= form_for 'index' => begin
+  Epost-adresse
+  %= input_tag 'email', type => 'email'
   <br>
-  %= link_to "I've forgotten my username or password" => 'reset'
+  %= submit_button "Utfør"
 % end
+
+<span class="red">
+%= stash 'msg'
+</span>
 
 
 @@ reset.html.ep
 % layout 'default';
-% title 'Reset password';
-<h2>Enter the email address used when registering</h2>
-%= form_for 'send_reset_email' => (method =>  'post') => begin
-  Email address:
-  %= text_field 'email'
-  @ventelo.no
+% title 'Velge nytt passord';
+<h2>Hei <%= session 'gecos' %>!</h2>
+
+<p>Velg det nye passordet du ønsker for brukeren din 
+&quot;<%= session 'uid' %>&quot;. 
+Passordet må være minst 6 tegn langt.</p>
+
+%= form_for '/validate_password' => (method =>  'post') => begin
+  Passordet:
+  %= password_field 'pw1'
   <br>
 
-  %= submit_button "Send"
+  Gjenta passordet:
+  %= password_field 'pw2'
+  <br>
+
+  %= submit_button 'Lagre'
 % end
 
+<span class="red"><%= stash 'msg' %></span>
 
-@@ admin.html.ep
+
+@@ sent.html.ep
 % layout 'default';
-% title  'Admin';
-<h2>Administer users</h2>
-This is the place to administer all users
-<br>
-Do you want to:
-%= link_to "Add a new user" => 'adduser';
-<br>
-or
-%= link_to "Edit an existing user" => 'edituser';
+% title "E-post sent";
+<h2>E-post sent</h2>
+<p>En e-post med instruksjoner hvordan gå videre i gjenopprettingsprosedyren 
+er sent til epost-adressen: <%= flash 'email' %>
+</p>
 
 
-@@ adduser.html.ep
+@@ success.html.ep
 % layout 'default';
-% title  'Add user';
-<h2>Add a user to the LDAP repository</h2>
-%= form_for '/action/adduser' => (method => 'post' ) => begin
-  Login name: 
-  %= text_field 'uid'
-  <br />
-
-  Name of user:
-  %= text_field 'name'
-  <br />
-
-  Email address:
-  %= text_field 'email'
-  @ventelo.no
-  <br />
-
-  Default shell:
-  %= radio_button shell => "/bin/bash"
-  bash
-  <br />
-  %= radio_button shell => "/usr/bin/tcsh"
-  tcsh
-  <br />
-
-  The user should have sudo rights?
-  %= check_box sudo => 0
-  <br />
-
-  Which access rights should the user have to network devices?<br />
-  %= radio_button group => "__full"
-  Full (read and write to everything)
-  <br />
-
-  %= radio_button group => "__limited"
-  Limited (read and write to everything, but with some disabled commands)
-  <br />
-
-  %= radio_button group => "__readonly"
-  Read only (read on everything, including running config)
-  <br />
-
-  %= submit_button "Add user"
-% end
+% title 'Passordet er byttet';
+<h2>Passordet ditt er nå byttet</h2>
+<p>Prøv det nye passordet ved å logge inn med ssh på 
+<a href="ssh://srv1.lab.as2116.net">srv1.lab.as2116.net</a>.</p>
+<p>Dersom du fortsatt ikke får logget på, prøv gjenopprettingsprosedyren
+én gang til. Fungerer det ikke da heller, ta kontakt med en av
+<a href="http://wiki.lab.as2116.net/login.html">administratørene</a>.</p>
 
 
-@@ user.html.ep
+
+@@ failure.html.ep
 % layout 'default';
-% title  'Users';
-<h2>User self service</h2>
-This is the place to administer your profile
-<br>
+% title 'Feilmelding';
+<h2>Det har oppstått en feil</h2>
+<p><%= stash 'msg' %></p>
+
 
 
 @@ layouts/default.html.ep
-<!doctype html><html>
-  <head><title><%= title %></title></head>
-  <body><%= content %></body>
+<!doctype html>
+<html>
+<head>
+<title><%= title %></title>
+<meta charset="UTF-8" />
+<link rel="stylesheet" type="text/css" href="/style.css">
+</head>
+<body>
+<%= content %>
+</body>
 </html>
